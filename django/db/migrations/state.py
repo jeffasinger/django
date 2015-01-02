@@ -29,8 +29,40 @@ class ProjectState(object):
         # Apps to include from main registry, usually unmigrated ones
         self.real_apps = real_apps or []
 
-    def add_model_state(self, model_state):
-        self.models[(model_state.app_label, model_state.name.lower())] = model_state
+    def add_model(self, model_state):
+        app_label, model_name = model_state.app_label, model_state.name_lower
+        self.models[(app_label, model_name)] = model_state
+        if 'apps' in self.__dict__:  # hasattr would cache the property
+            self.reload_model(app_label, model_name)
+
+    def remove_model(self, app_label, model_name):
+        del self.models[app_label, model_name]
+        if 'apps' in self.__dict__:  # hasattr would cache the property
+            self.apps.unregister_model(app_label, model_name)
+
+    def reload_model(self, app_label, model_name):
+        if 'apps' in self.__dict__:  # hasattr would cache the property
+            # Get relations before reloading the models, as _meta.apps may change
+            try:
+                related_old = {
+                    f.related_model for f in
+                    self.apps.get_model(app_label, model_name)._meta.related_objects
+                }
+            except LookupError:
+                related_old = set()
+            self._reload_one_model(app_label, model_name)
+            # Reload models if there are relations
+            model = self.apps.get_model(app_label, model_name)
+            related_m2m = {f.related_model for f in model._meta.many_to_many}
+            for rel_model in related_old.union(related_m2m):
+                self._reload_one_model(rel_model._meta.app_label, rel_model._meta.model_name)
+            if related_m2m:
+                # Re-render this model after related models have been reloaded
+                self._reload_one_model(app_label, model_name)
+
+    def _reload_one_model(self, app_label, model_name):
+        self.apps.unregister_model(app_label, model_name)
+        self.models[app_label, model_name].render(self.apps)
 
     def clone(self):
         "Returns an exact copy of this ProjectState"
@@ -106,7 +138,7 @@ class ProjectState(object):
         app_models = {}
         for model in apps.get_models(include_swapped=True):
             model_state = ModelState.from_model(model)
-            app_models[(model_state.app_label, model_state.name.lower())] = model_state
+            app_models[(model_state.app_label, model_state.name_lower)] = model_state
         return cls(app_models)
 
     def __eq__(self, other):
@@ -161,6 +193,10 @@ class ModelState(object):
                 raise ValueError(
                     'ModelState.fields cannot be bound to a model - "%s" is.' % name
                 )
+
+    @cached_property
+    def name_lower(self):
+        return self.name.lower()
 
     @classmethod
     def from_model(cls, model, exclude_rels=False):
